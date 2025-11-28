@@ -1,3 +1,5 @@
+message(STATUS "Configuring ESP32 port of MicroPython")
+
 # Top-level cmake file for building MicroPython on ESP32.
 #
 # Note for maintainers: Where possible, functionality should be put into
@@ -20,6 +22,7 @@ endif()
 
 # If a board variant is specified, check that it exists.
 if(MICROPY_BOARD_VARIANT)
+    message(FATAL_ERROR "MICROPY_BOARD_VARIANT specified: ${MICROPY_BOARD_VARIANT}")
     if(NOT EXISTS ${MICROPY_BOARD_DIR}/mpconfigvariant_${MICROPY_BOARD_VARIANT}.cmake)
         message(FATAL_ERROR "Invalid MICROPY_BOARD_VARIANT specified: ${MICROPY_BOARD_VARIANT}")
     endif()
