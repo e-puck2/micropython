@@ -83,7 +83,6 @@ mp_obj_t epuck2_set_rgb(size_t n_args, const mp_obj_t *args) {
         //rgb_update_led8(red, green, blue);
         uart_set_rgb_led8(red, green, blue);
     }
-    uart_get_data_ptr();
     
     return mp_const_none;
 }
@@ -420,6 +419,51 @@ mp_obj_t epuck2_get_all_sensors(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_get_all_sensors_obj, epuck2_get_all_sensors);
 
+/// \method epuck2_play_freq()
+/// Play a tone at specified frequency.
+/// \param  value: frequency in Hz from 100 to 10000 Hz
+/// Return `None`.
+mp_obj_t epuck2_play_freq(mp_obj_t value) {
+    uint16_t val = mp_obj_get_int(value);
+    if((val < 100) && (val != 0)) // 0 to stop sound
+    {
+        val = 100;
+    }
+    else if(val > 10000)
+    {
+        val = 10000;
+    }
+    uart_set_sound_freq(val);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(epuck2_play_freq_obj, epuck2_play_freq);
+
+/// \method epuck2_get_mic_data()
+/// Get the raw data for all 4 microphones (160 samples, 16 bits for each channel, 10 ms of data). This is a blocking function.
+/// \param  buufer: interleaved data (right, left, back, front))
+/// Return true in case of success, false otherwise.
+mp_obj_t epuck2_get_mic_data(mp_obj_t buffer_obj) {
+    // Get a pointer to the internal memory of the MicroPython bytearray
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(buffer_obj, &bufinfo, MP_BUFFER_WRITE);
+
+    // Ensure the buffer is large enough (160 samples * 4 mics * 2 bytes = 1280)
+    if (bufinfo.len < 1280) {
+        mp_raise_ValueError(MP_ERROR_TEXT("Buffer too small"));
+    }
+
+    // Call your C function directly into the bytearray's memory
+    int8_t status = uart_get_mic_data((uint8_t *)bufinfo.buf);
+    
+    if (status == 0) {
+        return mp_const_true;
+    } else {
+        return mp_const_false;
+    }
+}
+// Update to MP_DEFINE_CONST_FUN_OBJ_1 because it now takes 1 argument
+static MP_DEFINE_CONST_FUN_OBJ_1(epuck2_get_mic_data_obj, epuck2_get_mic_data);
+
 mp_rom_map_elem_t epuck2_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_epuck2) },
 
@@ -441,6 +485,8 @@ mp_rom_map_elem_t epuck2_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_play_sound), MP_ROM_PTR(&epuck2_play_sound_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_all_actuators), MP_ROM_PTR(&epuck2_set_all_actuators_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_all_sensors), MP_ROM_PTR(&epuck2_get_all_sensors_obj) },
+    { MP_ROM_QSTR(MP_QSTR_play_freq), MP_ROM_PTR(&epuck2_play_freq_obj) },
+    { MP_ROM_QSTR(MP_QSTR_get_mic_data), MP_ROM_PTR(&epuck2_get_mic_data_obj) },
 };
 
 static MP_DEFINE_CONST_DICT(epuck2_module_globals, epuck2_module_globals_table);

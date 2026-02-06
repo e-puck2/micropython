@@ -19,3 +19,4 @@
 #define MICROPY_PY_MACHINE_I2S             (0)
 #define MICROPY_PY_MACHINE_I2C_TARGET       (0)
 #define MICROPY_PY_ESP32_PCNT               (0)
+#define MICROPY_PY_ULAB                     (1)
