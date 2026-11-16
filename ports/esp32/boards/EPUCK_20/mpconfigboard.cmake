@@ -8,7 +8,7 @@ set(SDKCONFIG_DEFAULTS
 )
 
 list(APPEND MICROPY_DEF_BOARD
-    MICROPY_HW_MCU_NAME="E-puck2"
+    MICROPY_HW_BOARD_NAME="E-puck 2.0"
     # Disable some options to reduce firmware size.
     MICROPY_OPT_COMPUTED_GOTO=0
     MICROPY_PY_NETWORK_LAN=0

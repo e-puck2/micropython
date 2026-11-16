@@ -44,6 +44,8 @@
 #include "../../../../../main/rgb_led_e-puck2.h"
 #include "../../../../../main/uart_e-puck2.h"
 #include "../../../../../main/button_e-puck2.h"
+#include "../../../../../main/spi_e-puck2.h"
+#include "py/mpthread.h"
 
 char api_version[6] = "XX.XX\0";
 char temp_buff[512];
@@ -464,6 +466,219 @@ mp_obj_t epuck2_get_mic_data(mp_obj_t buffer_obj) {
 // Update to MP_DEFINE_CONST_FUN_OBJ_1 because it now takes 1 argument
 static MP_DEFINE_CONST_FUN_OBJ_1(epuck2_get_mic_data_obj, epuck2_get_mic_data);
 
+/******************************************************************************/
+// Camera.
+// The image source depends on the F407 selector position (read at the first camera call):
+// - selector 15: the F407 streams 160x120 RGB565 images to the ESP32 through SPI;
+// - other positions (e.g. 3): the image is requested to the F407 with the asercom command -'I' through UART
+//   (default 40x40 RGB565, format set on the F407 side, at most 4136 bytes).
+
+#define CAM_SRC_UNKNOWN 0
+#define CAM_SRC_SPI     1
+#define CAM_SRC_UART    2
+
+static uint8_t cam_source = CAM_SRC_UNKNOWN;
+static uint32_t cam_last_id = 0;
+static uint8_t cam_width = 0, cam_height = 0, cam_bpp = 0; // Format of the last image (0 = unknown).
+static uint32_t cam_uart_frames = 0, cam_uart_errors = 0;
+
+static uint8_t camera_source(void) {
+    if (cam_source == CAM_SRC_UNKNOWN) {
+        uint8_t selector = 0;
+        MP_THREAD_GIL_EXIT();
+        uart_get_selector(&selector);
+        MP_THREAD_GIL_ENTER();
+        if (selector == 15) {
+            cam_source = CAM_SRC_SPI;
+            cam_width = SPI_IMG_WIDTH;
+            cam_height = SPI_IMG_HEIGHT;
+            cam_bpp = 2;
+        } else {
+            cam_source = CAM_SRC_UART;
+        }
+    }
+    return cam_source;
+}
+
+static mp_obj_t camera_get_image_spi(mp_buffer_info_t *bufinfo, mp_int_t timeout_ms) {
+    if (bufinfo->len < SPI_IMG_SIZE) {
+        mp_raise_ValueError(MP_ERROR_TEXT("buffer too small"));
+    }
+    mp_uint_t start = mp_hal_ticks_ms();
+    for (;;) {
+        bool available;
+        MP_THREAD_GIL_EXIT();
+        available = spi_wait_image(cam_last_id, pdMS_TO_TICKS(10));
+        MP_THREAD_GIL_ENTER();
+
+        if (available) {
+            uint32_t id = 0;
+            int32_t n;
+            MP_THREAD_GIL_EXIT();
+            n = spi_copy_image((uint8_t *)bufinfo->buf, bufinfo->len, &id);
+            MP_THREAD_GIL_ENTER();
+            if (n > 0) {
+                cam_last_id = id;
+                return mp_obj_new_int_from_uint(id);
+            }
+        }
+
+        mp_handle_pending(true); // Allow Ctrl-C.
+        if (timeout_ms >= 0 && (mp_hal_ticks_ms() - start) >= (mp_uint_t)timeout_ms) {
+            return mp_const_none;
+        }
+    }
+}
+
+static mp_obj_t camera_get_image_uart(mp_buffer_info_t *bufinfo) {
+    uint8_t mode = 0, width = 0, height = 0;
+    int32_t n;
+    MP_THREAD_GIL_EXIT();
+    n = uart_get_image((uint8_t *)bufinfo->buf, bufinfo->len, &mode, &width, &height);
+    MP_THREAD_GIL_ENTER();
+    if (n <= 0) {
+        cam_uart_errors++;
+        return mp_const_none;
+    }
+    cam_uart_frames++;
+    cam_width = width;
+    cam_height = height;
+    cam_bpp = (mode == UART_IMG_MODE_GREY) ? 1 : 2;
+    if (++cam_last_id == 0) {
+        cam_last_id = 1;
+    }
+    return mp_obj_new_int_from_uint(cam_last_id);
+}
+
+/// \method camera_get_image(buffer, timeout_ms=1000)
+/// Copy a camera image into "buffer" (bytearray, CAM_IMAGE_SIZE bytes are enough for every mode).
+/// - selector 15 (SPI): waits for an image newer than the one returned by the previous call (at most timeout_ms);
+/// - other selector positions (UART): requests a new image to the F407 and waits for it (timeout_ms isn't used,
+///   the request fails by itself after about 1 s without answer).
+/// The image format is returned by camera_get_format(). Pixels are stored row by row; RGB565 uses 2 bytes per
+/// pixel big endian (RRRRRGGG GGGBBBBB), greyscale 1 byte per pixel.
+/// Return the image id (incremented at each image received), or None on timeout/error.
+static mp_obj_t epuck2_camera_get_image(size_t n_args, const mp_obj_t *args) {
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(args[0], &bufinfo, MP_BUFFER_WRITE);
+    mp_int_t timeout_ms = (n_args > 1) ? mp_obj_get_int(args[1]) : 1000;
+
+    if (camera_source() == CAM_SRC_SPI) {
+        return camera_get_image_spi(&bufinfo, timeout_ms);
+    }
+    return camera_get_image_uart(&bufinfo);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(epuck2_camera_get_image_obj, 1, 2, epuck2_camera_get_image);
+
+/// \method camera_get_format()
+/// Return (width, height, bytes_per_pixel) of the images returned by camera_get_image(): bytes_per_pixel is 2 for
+/// RGB565 and 1 for greyscale. In UART mode the format is known only after the first image (None before).
+static mp_obj_t epuck2_camera_get_format(void) {
+    camera_source();
+    if (cam_bpp == 0) {
+        return mp_const_none;
+    }
+    mp_obj_t items[3] = {
+        MP_OBJ_NEW_SMALL_INT(cam_width),
+        MP_OBJ_NEW_SMALL_INT(cam_height),
+        MP_OBJ_NEW_SMALL_INT(cam_bpp),
+    };
+    return mp_obj_new_tuple(3, items);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_camera_get_format_obj, epuck2_camera_get_format);
+
+#define CAM_SENSOR_WIDTH        640
+#define CAM_SENSOR_HEIGHT       480
+#define CAM_UART_MAX_IMAGE_SIZE 4136 // Asercom image buffer on the F407.
+
+/// \method camera_set_format(width, height, bytes_per_pixel=2, zoom=4, x1=-1, y1=-1)
+/// Set the image format (UART mode only, i.e. selector different from 15, where the format is fixed to 160x120):
+/// - width, height: image size in pixels (1..255), width*height*bytes_per_pixel must be at most 4136 bytes;
+/// - bytes_per_pixel: 2 for RGB565, 1 for greyscale;
+/// - zoom: subsampling factor 1, 2 or 4, the image covers (width*zoom)x(height*zoom) pixels of the 640x480 sensor;
+/// - x1, y1: top-left corner of that area on the sensor, -1 to center it.
+/// Default format on the F407: 40x40 RGB565, zoom 4, centered.
+/// Return True if the F407 confirmed the new format, False otherwise.
+/// Raise ValueError("invalid camera format") if a parameter is out of range or with selector 15.
+/// (A single error message is used on purpose: every new MP_ERROR_TEXT message makes all the error texts of the
+/// firmware, ulab included, more expensive to compile; 7 messages made the firmware about 17 KB bigger.)
+static mp_obj_t epuck2_camera_set_format(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_width, ARG_height, ARG_bytes_per_pixel, ARG_zoom, ARG_x1, ARG_y1 };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_width, MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_height, MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_bytes_per_pixel, MP_ARG_INT, {.u_int = 2} },
+        { MP_QSTR_zoom, MP_ARG_INT, {.u_int = 4} },
+        { MP_QSTR_x1, MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_y1, MP_ARG_INT, {.u_int = -1} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+    mp_int_t width = args[ARG_width].u_int;
+    mp_int_t height = args[ARG_height].u_int;
+    mp_int_t bpp = args[ARG_bytes_per_pixel].u_int;
+    mp_int_t zoom = args[ARG_zoom].u_int;
+    mp_int_t x1 = args[ARG_x1].u_int;
+    mp_int_t y1 = args[ARG_y1].u_int;
+
+    // The F407 doesn't report configuration errors, so check here everything the camera driver would refuse:
+    // size 1..255 (1 byte in the image header), image at most 4136 bytes, zoom 1/2/4, area inside the sensor.
+    if (camera_source() == CAM_SRC_SPI
+        || width < 1 || width > 255 || height < 1 || height > 255
+        || (bpp != 1 && bpp != 2)
+        || width * height * bpp > CAM_UART_MAX_IMAGE_SIZE
+        || (zoom != 1 && zoom != 2 && zoom != 4)
+        || width * zoom > CAM_SENSOR_WIDTH || height * zoom > CAM_SENSOR_HEIGHT
+        || x1 < -1 || y1 < -1
+        || (x1 >= 0 && x1 + width * zoom > CAM_SENSOR_WIDTH)
+        || (y1 >= 0 && y1 + height * zoom > CAM_SENSOR_HEIGHT)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid camera format"));
+    }
+
+    int8_t ret;
+    MP_THREAD_GIL_EXIT();
+    ret = uart_set_camera(bpp == 1 ? UART_IMG_MODE_GREY : UART_IMG_MODE_RGB565, width, height, zoom, x1, y1);
+    MP_THREAD_GIL_ENTER();
+    if (ret != 0) {
+        return mp_const_false;
+    }
+    cam_width = width;
+    cam_height = height;
+    cam_bpp = bpp;
+    return mp_const_true;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(epuck2_camera_set_format_obj, 2, epuck2_camera_set_format);
+
+/// \method camera_get_stats()
+/// Return (frames, errors) since boot or since the last camera_reset_stats():
+/// - SPI: images received by the ESP32 (streamed continuously) and images discarded (unexpected packet size);
+/// - UART: images received and failed requests.
+static mp_obj_t epuck2_camera_get_stats(void) {
+    uint32_t frames, errors;
+    if (camera_source() == CAM_SRC_SPI) {
+        spi_get_image_stats(&frames, &errors);
+    } else {
+        frames = cam_uart_frames;
+        errors = cam_uart_errors;
+    }
+    mp_obj_t items[2] = {
+        mp_obj_new_int_from_uint(frames),
+        mp_obj_new_int_from_uint(errors),
+    };
+    return mp_obj_new_tuple(2, items);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_camera_get_stats_obj, epuck2_camera_get_stats);
+
+/// \method camera_reset_stats()
+/// Reset the counters returned by camera_get_stats().
+static mp_obj_t epuck2_camera_reset_stats(void) {
+    spi_reset_image_stats();
+    cam_uart_frames = 0;
+    cam_uart_errors = 0;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_camera_reset_stats_obj, epuck2_camera_reset_stats);
+
 mp_rom_map_elem_t epuck2_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_epuck2) },
 
@@ -487,6 +702,12 @@ mp_rom_map_elem_t epuck2_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_get_all_sensors), MP_ROM_PTR(&epuck2_get_all_sensors_obj) },
     { MP_ROM_QSTR(MP_QSTR_play_freq), MP_ROM_PTR(&epuck2_play_freq_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_mic_data), MP_ROM_PTR(&epuck2_get_mic_data_obj) },
+    { MP_ROM_QSTR(MP_QSTR_camera_get_image), MP_ROM_PTR(&epuck2_camera_get_image_obj) },
+    { MP_ROM_QSTR(MP_QSTR_camera_get_format), MP_ROM_PTR(&epuck2_camera_get_format_obj) },
+    { MP_ROM_QSTR(MP_QSTR_camera_set_format), MP_ROM_PTR(&epuck2_camera_set_format_obj) },
+    { MP_ROM_QSTR(MP_QSTR_camera_get_stats), MP_ROM_PTR(&epuck2_camera_get_stats_obj) },
+    { MP_ROM_QSTR(MP_QSTR_camera_reset_stats), MP_ROM_PTR(&epuck2_camera_reset_stats_obj) },
+    { MP_ROM_QSTR(MP_QSTR_CAM_IMAGE_SIZE), MP_ROM_INT(SPI_IMG_SIZE) },
 };
 
 static MP_DEFINE_CONST_DICT(epuck2_module_globals, epuck2_module_globals_table);
