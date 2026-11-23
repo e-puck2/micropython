@@ -48,19 +48,92 @@
 #include "py/mpthread.h"
 #include "epuck2_image.h"
 
+/// \module epuck2
+/// The `epuck2` module gives access to the sensors and actuators of the e-puck2 robot from the MicroPython firmware of the ESP32 radio module. The ESP32 exchanges data with the main microcontroller (STM32F407) through UART, using the advanced sercom protocol, and receives the camera images through SPI.
+///
+/// The functions need the robot selector in position 3 or 15, where the main microcontroller runs the advanced sercom protocol. The camera images are streamed continuously through SPI only in position 15 (faster); in position 3 every image is requested through UART.
+///
+/// The same API is available on e-puck2.0/2.1 (4 MB flash, no PSRAM) and on e-puck2.2 (8 MB flash and 2 MB PSRAM, so more RAM for the user programs).
+/// \example A first program: print the API version and the proximity sensors, then turn on the front LED for one second
+///     import epuck2
+///     import time
+///
+///     print("API version:", epuck2.get_api_version())
+///     print("proximity:", epuck2.get_proximity())
+///     epuck2.set_leds(0x20)  # Front LED on.
+///     time.sleep(1)
+///     epuck2.set_leds(0)
+/// \endexample
+/// \section System: get_api_version, get_selector, button_pressed, get_battery, sd_available
+/// API version and general state of the robot.
+/// \section Motors: set_motors_speed
+/// The two wheels are driven by stepper motors: 1000 steps make one wheel revolution, about 12.9 cm.
+/// \section LEDs: set_leds, set_rgb, set_all_rgb
+/// The robot has 8 LEDs around its body: LED1, LED3, LED5 and LED7 are red, LED2, LED4, LED6 and LED8 are RGB. It also has a green body LED and a red front LED.
+/// \section Sound: play_sound, play_freq
+/// Sounds and tones played by the speaker of the robot.
+/// \section Sensors: get_proximity, get_distance, get_acc_raw, get_gyro_raw, get_mic_volume, get_mic_data, get_tv_remote, set_magnetometer
+/// The values are the last ones received from the main microcontroller, which sends all the sensors continuously.
+/// \section Bulk functions: set_all_actuators, get_all_sensors
+/// Set all the actuators or read all the sensors with a single call, in the same format as the advanced sercom / WiFi packets.
+/// \section Camera: camera_get_image, camera_get_format, camera_set_format, camera_get_stats, camera_reset_stats, CAM_IMAGE_SIZE
+/// The camera is connected to the main microcontroller. The image source depends on the selector position, read at the first camera call:
+/// - position 15: the main microcontroller streams 160x120 RGB565 images to the ESP32 through SPI, continuously. The ESP32 can crop, downscale and convert them to greyscale (`camera_set_format()`).
+/// - position 3: every image is requested to the main microcontroller through UART (115200 baud: a few images per second). The image is at most 4136 bytes.
+///
+/// Images are stored row by row, from the top-left pixel. RGB565 images use 2 bytes per pixel, big endian (`RRRRRGGG GGGBBBBB`); greyscale images use 1 byte per pixel (0 black, 255 white).
+/// \section Image processing: image_get_color, image_find_blobs_color, image_find_blobs_grey, image_diff
+/// Simple vision functions, implemented in C, working on the images returned by `camera_get_image()` (any buffer with the same layout can be used).
+///
+/// Common parameters:
+/// - `img`: the image (bytearray or any buffer).
+/// - `fmt`: the image format `(width, height, bytes_per_pixel)`, as returned by `camera_get_format()`.
+/// - `roi`: region of interest `(x, y, w, h)` to process, `None` for the whole image.
+/// - `min_pixels`: blobs with fewer pixels are ignored (noise), default 10.
+/// - `max_blobs`: maximum number of blobs returned, 1..64, default 8.
+///
+/// A blob is a group of selected pixels touching each other, also diagonally: two separate objects give two blobs. Each blob is returned as a tuple `(pixels, cx, cy, x_min, y_min, x_max, y_max)`: number of pixels, centroid and bounding box (included), in image coordinates. The blobs are sorted by size, biggest first; the list is empty if nothing is found.
+///
+/// The work memory is allocated at each call and depends only on the width of the region (about 3 KB for 80 pixels, 6 KB for 160 pixels), so the functions can be used also on e-puck2.0/2.1. Invalid arguments raise `ValueError`.
+/// \example Find the biggest red object in a 80x60 image (selector 15)
+///     import epuck2
+///
+///     FMT = (80, 60, 2)
+///     epuck2.camera_set_format(80, 60, 2, 8)  # Whole view, half resolution.
+///     img = bytearray(80 * 60 * 2)
+///     if epuck2.camera_get_image(img) is not None:
+///         blobs = epuck2.image_find_blobs_color(img, FMT, 340, 20, max_blobs=1)
+///         if blobs:
+///             pixels, cx, cy, x_min, y_min, x_max, y_max = blobs[0]
+///             print("red object at", cx, cy, "size", pixels)
+/// \endexample
+
 char api_version[6] = "XX.XX\0";
 char temp_buff[512];
 
-// Get current e-puck2 API version.
+/// \function get_api_version()
+/// Get the version of the epuck2 module API, as "major.minor" (each number is padded with spaces to 2 characters, e.g. " 1.2 "). The minor version is incremented when functions are added, the major version when the existing functions change.
+/// \return string.
+/// \example Print the API version
+///     import epuck2
+///     print(epuck2.get_api_version())
+/// \endexample
 static mp_obj_t get_api_version(void) {
     snprintf(api_version, 6, "%2d.%-2d", EPUCK2_API_MAJOR_VERSION, EPUCK2_API_MINOR_VERSION);
     return mp_obj_new_str(api_version, strlen(api_version));
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(get_api_version_obj, get_api_version);
 
-/// \method epuck2_set_rgb([led, value red, value green, value blue])
-/// Set the LED intensities.  Intensity ranges between 0 (off) and 100 (full on).
-/// Return `None`.
+/// \function set_rgb(led, red, green, blue)
+/// Set the color of one RGB LED.
+/// \param led LED to set: 0 = LED2, 1 = LED4, 2 = LED6, 3 = LED8 (other values are ignored).
+/// \param red intensity of the red component, between 0 (off) and 100 (full on).
+/// \param green intensity of the green component, between 0 and 100.
+/// \param blue intensity of the blue component, between 0 and 100.
+/// \example Set LED2 to half intensity blue
+///     import epuck2
+///     epuck2.set_rgb(0, 0, 0, 50)
+/// \endexample
 mp_obj_t epuck2_set_rgb(size_t n_args, const mp_obj_t *args) {
     int l = mp_obj_get_int(args[0]);
     int red = mp_obj_get_int(args[1]);
@@ -91,9 +164,15 @@ mp_obj_t epuck2_set_rgb(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(epuck2_set_rgb_obj, 4, 4, epuck2_set_rgb);
 
-/// \method eupck2_set_all_rgb([red2, green2, blue2, red4, green4, blue4, red6, green6, blue6, red8, green8, blue8])
-/// Set all LED intensities.  Intensity ranges between 0 (off) and 100 (full on).
-/// Return `None`.
+/// \function set_all_rgb(red2, green2, blue2, red4, green4, blue4, red6, green6, blue6, red8, green8, blue8)
+/// Set the color of the four RGB LEDs at once: red, green and blue intensities of LED2, LED4, LED6 and LED8, each between 0 (off) and 100 (full on).
+/// \example Set LED2 to red and LED4 to green, turn off LED6 and LED8
+///     import epuck2
+///     epuck2.set_all_rgb(100, 0, 0,   # LED2
+///                        0, 100, 0,   # LED4
+///                        0, 0, 0,     # LED6
+///                        0, 0, 0)     # LED8
+/// \endexample
 mp_obj_t epuck2_set_all_rgb(size_t n_args, const mp_obj_t *args) {
     uint8_t rgb_values[12];
     rgb_values[0] = (uint8_t)mp_obj_get_int(args[0]);
@@ -114,9 +193,19 @@ mp_obj_t epuck2_set_all_rgb(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(epuck2_set_all_rgb_obj, 12, 12, epuck2_set_all_rgb);
 
-/// \method epuck2_set_speed()
-/// Set motors speed. Range is between -1000 and 1000.
-/// Return `None`.
+/// \function set_motors_speed(left, right)
+/// Set the speed of the two motors. The motors keep the speed until it is changed: call `set_motors_speed(0, 0)` to stop the robot.
+/// \param left speed of the left motor in steps per second, between -1100 and 1100 (negative values move the wheel backward, values outside the range are limited to it). 1000 steps per second are one wheel revolution per second, about 12.9 cm/s.
+/// \param right speed of the right motor, same range as `left`.
+/// \example Move forward, turn in place, then stop
+///     import epuck2
+///     import time
+///     epuck2.set_motors_speed(500, 500)    # Forward at about 6.5 cm/s.
+///     time.sleep(1)
+///     epuck2.set_motors_speed(300, -300)   # Turn right in place.
+///     time.sleep(1)
+///     epuck2.set_motors_speed(0, 0)        # Stop.
+/// \endexample
 mp_obj_t epuck2_set_motors_speed(mp_obj_t left, mp_obj_t right) {
     int l = mp_obj_get_int(left);
     int r = mp_obj_get_int(right);
@@ -125,15 +214,23 @@ mp_obj_t epuck2_set_motors_speed(mp_obj_t left, mp_obj_t right) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(epuck2_set_motors_speed_obj, epuck2_set_motors_speed);
 
-/// \method epuck2_set_leds()
-/// Set the LEDs state (on, off).
-/// \param  bit0: 0=LED1 off; 1=LED1 on
-///         bit1: 0=LED3 off; 1=LED3 on
-///         bit2: 0=LED5 off; 1=LED5 on
-///         bit3: 0=LED7 off; 1=LED7 on
-///         bit4: 0=body LED off; 1=body LED on
-///         bit5: 0=front LED off; 1=front LED on
-/// Return `None`.
+/// \function set_leds(value)
+/// Turn on or off the red LEDs (LED1, LED3, LED5, LED7), the body LED and the front LED.
+/// \param value bitmask, a bit set to 1 turns the corresponding LED on:
+/// | Bit | Value | LED |
+/// | 0 | 0x01 | LED1 (front) |
+/// | 1 | 0x02 | LED3 (right) |
+/// | 2 | 0x04 | LED5 (back) |
+/// | 3 | 0x08 | LED7 (left) |
+/// | 4 | 0x10 | Body LED (green) |
+/// | 5 | 0x20 | Front LED (red) |
+/// \example Turn on LED1 and the front LED, then turn all of them off
+///     import epuck2
+///     import time
+///     epuck2.set_leds(0x01 | 0x20)
+///     time.sleep(1)
+///     epuck2.set_leds(0)
+/// \endexample
 mp_obj_t epuck2_set_leds(mp_obj_t value) {
     uint8_t val = mp_obj_get_int(value);
     uart_set_leds(val);
@@ -141,10 +238,24 @@ mp_obj_t epuck2_set_leds(mp_obj_t value) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(epuck2_set_leds_obj, epuck2_set_leds);
 
-/// \method epuck2_play_sound()
-/// Play onboard sound.
-/// \param  id: 0x01=MARIO, 0x02=UNDERWOLRD, 0x04=STARWARS, 0x08=4KHz, 0x10=10KHz, 0x20=stop sound
-/// Return `None`.
+/// \function play_sound(id)
+/// Play one of the sounds stored in the robot.
+/// \param id sound to play:
+/// | Value | Sound |
+/// | 0x01 | Mario |
+/// | 0x02 | Underworld |
+/// | 0x04 | Star Wars |
+/// | 0x08 | 4 kHz tone |
+/// | 0x10 | 10 kHz tone |
+/// | 0x20 | Stop the sound |
+/// | 0x40 | Christmas song |
+/// \example Play the Mario song for 3 seconds
+///     import epuck2
+///     import time
+///     epuck2.play_sound(0x01)
+///     time.sleep(3)
+///     epuck2.play_sound(0x20)
+/// \endexample
 mp_obj_t epuck2_play_sound(mp_obj_t value) {
     uint8_t val = mp_obj_get_int(value);
     uart_set_sound(val);
@@ -152,9 +263,20 @@ mp_obj_t epuck2_play_sound(mp_obj_t value) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(epuck2_play_sound_obj, epuck2_play_sound);
 
-/// \method set_all_actuators([settings, motor left, motor right, leds, red2, green2, blue2, red4, green4, blue4, red6, green6, blue6, red8, green8, blue8, sound])
-/// Set all actuators at once.
-/// Return `None`.
+/// \function set_all_actuators(settings, left, right, leds, red2, green2, blue2, red4, green4, blue4, red6, green6, blue6, red8, green8, blue8, sound)
+/// Set all the actuators with a single call.
+/// \param settings bitmask: bit 0 = 1 calibrates the proximity sensors (keep the robot away from objects); bit 1 = 1 enables the onboard obstacle avoidance (not implemented yet); bit 2 = 0 means that `left` and `right` are speeds, 1 that they are motor steps (position).
+/// \param left left motor speed (-1100..1100 steps per second, see `set_motors_speed()`) or steps.
+/// \param right right motor speed or steps.
+/// \param leds red LEDs, body LED and front LED bitmask (see `set_leds()`).
+/// \param red2 the 12 values `red2` ... `blue8` are the intensities of the RGB LEDs LED2, LED4, LED6 and LED8, between 0 and 100 (see `set_all_rgb()`).
+/// \param sound sound to play (see `play_sound()`), 0 for none.
+/// \example Move forward with LED1 and the front LED on, all RGB LEDs blue, no sound
+///     import epuck2
+///     epuck2.set_all_actuators(0, 300, 300, 0x21,
+///                              0, 0, 50, 0, 0, 50, 0, 0, 50, 0, 0, 50,
+///                              0)
+/// \endexample
 mp_obj_t epuck2_set_all_actuators(size_t n_args, const mp_obj_t *args) {
     uint8_t values[19];
     int16_t temp = 0;
@@ -182,11 +304,17 @@ mp_obj_t epuck2_set_all_actuators(size_t n_args, const mp_obj_t *args) {
     uart_set_all_actuators(values);    
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(epuck2_set_all_actuators_obj, 19, 19, epuck2_set_all_actuators);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(epuck2_set_all_actuators_obj, 17, 17, epuck2_set_all_actuators);
 
-/// \method get_proximity()
-/// Get proximity sensor value (the higher the value, the closer the object). 
-/// Return list: index 0 represents proximity front right, then goes clockwise.
+/// \function get_proximity()
+/// Get the values of the 8 infrared proximity sensors placed around the robot. The higher the value, the closer the object.
+/// \return list of 8 integers between 0 (no object) and 4095 (object very close): index 0 is the front right sensor (Prox0), then the sensors follow clockwise up to the front left sensor (Prox7).
+/// \example Stop when an object is in front of the robot
+///     import epuck2
+///     prox = epuck2.get_proximity()
+///     if prox[0] > 500 or prox[7] > 500:
+///         epuck2.set_motors_speed(0, 0)
+/// \endexample
 mp_obj_t epuck2_get_proximity(void) {
     mp_obj_list_t *data = MP_OBJ_TO_PTR(mp_obj_new_list(8, NULL));
     uint8_t prox_temp[16];
@@ -203,17 +331,32 @@ mp_obj_t epuck2_get_proximity(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_get_proximity_obj, epuck2_get_proximity);
 
-/// \method button_pressed()
-/// Get button state.
-/// Return true if pressed.
+/// \function button_pressed()
+/// Get the state of the user button of the ESP32 radio module.
+/// \return `True` if the button is pressed, `False` otherwise.
+/// \example Wait until the button is pressed and released
+///     import epuck2
+///     import time
+///     while not epuck2.button_pressed():
+///         time.sleep_ms(10)
+///     while epuck2.button_pressed():
+///         time.sleep_ms(10)
+///     print("button pressed")
+/// \endexample
 mp_obj_t epuck2_button_pressed(void) {
     return mp_obj_new_bool(button_is_pressed());
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_button_pressed_obj, epuck2_button_pressed);
 
-/// \method get_proximity()
-/// Get microphone volume, range is [0..4095].
-/// Return list: 0=mic right, 1=mic left, 2=mic back, 3=mic front
+/// \function get_mic_volume()
+/// Get the volume (amplitude) measured by the 4 microphones.
+/// \return list of 4 integers between 0 and 4095: `[right, left, back, front]`.
+/// \example Find the loudest microphone
+///     import epuck2
+///     vol = epuck2.get_mic_volume()
+///     names = ("right", "left", "back", "front")
+///     print("loudest:", names[vol.index(max(vol))])
+/// \endexample
 mp_obj_t epuck2_get_mic(void) {
     mp_obj_list_t *data = MP_OBJ_TO_PTR(mp_obj_new_list(4, NULL));
     uint8_t temp[8];
@@ -226,9 +369,13 @@ mp_obj_t epuck2_get_mic(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_get_mic_obj, epuck2_get_mic);
 
-/// \method epuck2_get_distance()
-/// Get distance from ToF sensor in millimeters.
-/// Return distance between 0 and 2000
+/// \function get_distance()
+/// Get the distance measured by the front time of flight (ToF) sensor.
+/// \return distance in millimeters, between 0 and 2000.
+/// \example Print the distance of the object in front of the robot
+///     import epuck2
+///     print(epuck2.get_distance(), "mm")
+/// \endexample
 mp_obj_t epuck2_get_distance(void) {
     uint8_t temp[2];
     uart_get_distance(temp);    
@@ -241,9 +388,13 @@ mp_obj_t epuck2_get_distance(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_get_distance_obj, epuck2_get_distance);
 
-/// \method sd_available()
-/// Get sd state.
-/// Return true if micro sd is available.
+/// \function sd_available()
+/// Check whether a micro SD card is inserted in the robot and can be read and written.
+/// \return `True` if the micro SD card is available, `False` otherwise.
+/// \example Check the micro SD card
+///     import epuck2
+///     print("micro SD available:", epuck2.sd_available())
+/// \endexample
 mp_obj_t epuck2_sd_available(void) {
     uint8_t temp;
     uart_get_sd_state(&temp);
@@ -251,9 +402,14 @@ mp_obj_t epuck2_sd_available(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_sd_available_obj, epuck2_sd_available);
 
-/// \method epuck2_get_acc_raw()
-/// Get acc raw values, range is [-1500..1500], resolution is +-2g
-/// Return list: 0=X, 1=Y, 3=Z
+/// \function get_acc_raw()
+/// Get the raw values of the accelerometer (range +-2 g).
+/// \return list `[x, y, z]`, each value between -1500 and 1500.
+/// \example Print the accelerometer values
+///     import epuck2
+///     x, y, z = epuck2.get_acc_raw()
+///     print(x, y, z)
+/// \endexample
 mp_obj_t epuck2_get_acc_raw(void) {
     mp_obj_list_t *data = MP_OBJ_TO_PTR(mp_obj_new_list(3, NULL));
     uint8_t temp[6];
@@ -265,9 +421,13 @@ mp_obj_t epuck2_get_acc_raw(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_get_acc_raw_obj, epuck2_get_acc_raw);
 
-/// \method epuck2_get_battery()
-/// Get battery raw value.
-/// Return battery value
+/// \function get_battery()
+/// Get the battery level as raw ADC value.
+/// \return integer, raw value (the higher, the more charged the battery).
+/// \example Print the battery level
+///     import epuck2
+///     print("battery:", epuck2.get_battery())
+/// \endexample
 mp_obj_t epuck2_get_battery(void) {
     uint8_t temp[2];
     uart_get_battery(temp);
@@ -275,9 +435,13 @@ mp_obj_t epuck2_get_battery(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_get_battery_obj, epuck2_get_battery);
 
-/// \method epuck2_get_gyro_raw()
-/// Get gyro raw values, range is [-32768..32767], resolution is +-250dps
-/// Return list: 0=X, 1=Y, 3=Z
+/// \function get_gyro_raw()
+/// Get the raw values of the gyroscope (range +-250 degrees per second).
+/// \return list `[x, y, z]`, each value between -32768 and 32767.
+/// \example Print the rotation speed around the vertical axis
+///     import epuck2
+///     print(epuck2.get_gyro_raw()[2])
+/// \endexample
 mp_obj_t epuck2_get_gyro_raw(void) {
     mp_obj_list_t *data = MP_OBJ_TO_PTR(mp_obj_new_list(3, NULL));
     uint8_t temp[6];
@@ -289,9 +453,13 @@ mp_obj_t epuck2_get_gyro_raw(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_get_gyro_raw_obj, epuck2_get_gyro_raw);
 
-/// \method epuck2_get_tv_remote()
-/// Get the TV remote data (RC5 protocol).
-/// Return data field
+/// \function get_tv_remote()
+/// Get the last command received from a TV remote control (RC5 protocol) by the infrared receiver.
+/// \return integer, data field of the RC5 command (e.g. the number of the button pressed).
+/// \example Print the TV remote command
+///     import epuck2
+///     print(epuck2.get_tv_remote())
+/// \endexample
 mp_obj_t epuck2_get_tv_remote(void) {
     uint8_t temp;
     uart_get_tv_remote(&temp);
@@ -299,9 +467,42 @@ mp_obj_t epuck2_get_tv_remote(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_get_tv_remote_obj, epuck2_get_tv_remote);
 
-/// \method epuck2_get_selector()
-/// Get the selector position, between 0 and 15
-/// Return selector position
+/// \function set_magnetometer(enable)
+/// Enable or disable the magnetometer. Its values (x, y, z in micro Tesla) are returned by `get_all_sensors()` at
+/// the indexes 9, 10 and 11.
+/// The behavior depends on the IMU of the robot:
+/// - MPU-9250: with the selector in position 15 the magnetometer is enabled at startup, in position 3 it must be
+///   enabled with this function (values updated 8 times per second). The main microcontroller firmware doesn't
+///   implement the disable yet: once enabled, the magnetometer keeps running until the robot is reset.
+/// - ICM-20948: the magnetometer is always enabled (values updated 50 times per second), this function is not
+///   needed.
+/// \param enable `True` to enable the magnetometer, `False` to disable it.
+/// \return `True` on success, `False` otherwise.
+/// \example Enable the magnetometer and print its values
+///     import epuck2
+///     import time
+///     epuck2.set_magnetometer(True)
+///     time.sleep_ms(200)  # Wait for the first measures.
+///     print(epuck2.get_all_sensors()[9:12])
+/// \endexample
+static mp_obj_t epuck2_set_magnetometer(mp_obj_t enable) {
+    bool on = mp_obj_is_true(enable);
+    int8_t ret;
+    MP_THREAD_GIL_EXIT();
+    ret = uart_set_magnetometer(on ? 1 : 0);
+    MP_THREAD_GIL_ENTER();
+    return mp_obj_new_bool(ret == 0);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(epuck2_set_magnetometer_obj, epuck2_set_magnetometer);
+
+/// \function get_selector()
+/// Get the position of the rotary selector on top of the robot.
+/// \return integer between 0 and 15.
+/// \example Run a different behavior depending on the selector
+///     import epuck2
+///     if epuck2.get_selector() == 15:
+///         print("camera images through SPI")
+/// \endexample
 mp_obj_t epuck2_get_selector(void) {
     uint8_t temp;
     uart_get_selector(&temp);
@@ -309,58 +510,35 @@ mp_obj_t epuck2_get_selector(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_get_selector_obj, epuck2_get_selector);
 
-/// \method epuck2_get_all_sensors()
-/// Get all sensors values at once. 
-/// Return list:
-/// 0: accelerometer raw x axis, between -1500 and 1500, resolution is +-2g
-/// 1: accelerometer raw y axis, between -1500 and 1500, resolution is +-2g
-/// 2: accelerometer raw z axis, between -1500 and 1500, resolution is +-2g
-/// 3: acceleration expressed in float: acceleration magnitude sqrt(x^2 + y^2 + z^2), between 0.0 and about 2600.0 (~3.46 g)
-/// 4: orientation expressed in float: between 0.0 and 360.0 degrees
-/// 5: inclination expressed in float: between 0.0 and 90.0 degrees (when tilted in any direction)
-/// 6: gyroscope raw x axis, between -32768 and 32767, resolution is +-250dps
-/// 7: gyroscope raw y axis, between -32768 and 32767, resolution is +-250dps
-/// 8: gyroscope raw z axis, between -32768 and 32767, resolution is +-250dps
-/// 9: magnetometer raw x axis expressed in float, range is +-4912.0 uT (magnetic flux density expressed in micro Tesla)
-/// 10: magnetometer raw y axis expressed in float, range is +-4912.0 uT (magnetic flux density expressed in micro Tesla)
-/// 11: magnetometer raw z axis expressed in float, range is +-4912.0 uT (magnetic flux density expressed in micro Tesla)
-/// 12: temperature given in Celsius degrees
-/// 13: IR proximity 0, between 0 (no objects detected) and 4095 (object near the sensor)
-/// 14: IR proximity 1, between 0 (no objects detected) and 4095 (object near the sensor)
-/// 15: IR proximity 2, between 0 (no objects detected) and 4095 (object near the sensor)
-/// 16: IR proximity 3, between 0 (no objects detected) and 4095 (object near the sensor)
-/// 17: IR proximity 4, between 0 (no objects detected) and 4095 (object near the sensor)
-/// 18: IR proximity 5, between 0 (no objects detected) and 4095 (object near the sensor)
-/// 19: IR proximity 6, between 0 (no objects detected) and 4095 (object near the sensor)
-/// 20: IR proximity 7, between 0 (no objects detected) and 4095 (object near the sensor)
-/// 21: IR proximity 0 ambient, between 0 (strong light) and 4095 (dark)
-/// 22: IR proximity 1 ambient, between 0 (strong light) and 4095 (dark)
-/// 23: IR proximity 2 ambient, between 0 (strong light) and 4095 (dark)
-/// 24: IR proximity 3 ambient, between 0 (strong light) and 4095 (dark)
-/// 25: IR proximity 4 ambient, between 0 (strong light) and 4095 (dark)
-/// 26: IR proximity 5 ambient, between 0 (strong light) and 4095 (dark)
-/// 27: IR proximity 6 ambient, between 0 (strong light) and 4095 (dark)
-/// 28: IR proximity 7 ambient, between 0 (strong light) and 4095 (dark)
-/// 29: Time of Flight distance: distance given in millimeters
-/// 30: mic0 volume between 0 and 4095
-/// 31: mic1 volume between 0 and 4095
-/// 32: mic2 volume between 0 and 4095
-/// 33: mic3 volume between 0 and 4095
-/// 34: left motor steps: 1000 steps per wheel revolution
-/// 35: right motor steps: 1000 steps per wheel revolution
-/// 36: battery raw value
-/// 37: uSD state: 1 if the micro sd is present and can be read/write, 0 otherwise
-/// 38: TV remote toggle (RC5 protocol)
-/// 39: TV remote address (RC5 protocol)
-/// 40: TV remote data (RC5 protocol)
-/// 41: selector position, between 0 and 15
-/// 42: ground proximity 0, between 0 (no surface at all or not reflective surface e.g. black) and 1023 (very reflective surface e.g. white)
-/// 43: ground proximity 1, between 0 (no surface at all or not reflective surface e.g. black) and 1023 (very reflective surface e.g. white)
-/// 44: ground proximity 2, between 0 (no surface at all or not reflective surface e.g. black) and 1023 (very reflective surface e.g. white)
-/// 45: ground proximity 0 ambient, between 0 (strong light) and 1023 (dark)
-/// 46: ground proximity 1 ambient, between 0 (strong light) and 1023 (dark)
-/// 47: ground proximity 2 ambient, between 0 (strong light) and 1023 (dark)
-/// 48: button state: 1 button pressed, 0 button released
+/// \function get_all_sensors()
+/// Get the values of all the sensors with a single call.
+/// \return list of 49 values:
+/// | Index | Value | Range |
+/// | 0, 1, 2 | Accelerometer x, y, z (raw) | -1500..1500, +-2 g |
+/// | 3 | Acceleration magnitude sqrt(x^2 + y^2 + z^2) (float) | 0.0..about 2600.0 (about 3.46 g) |
+/// | 4 | Orientation (float) | 0.0..360.0 degrees |
+/// | 5 | Inclination (float) | 0.0..90.0 degrees, when tilted in any direction |
+/// | 6, 7, 8 | Gyroscope x, y, z (raw) | -32768..32767, +-250 degrees per second |
+/// | 9, 10, 11 | Magnetometer x, y, z (float), see `set_magnetometer()` | +-4912.0 uT (micro Tesla) |
+/// | 12 | Temperature | degrees Celsius |
+/// | 13..20 | Proximity sensors 0..7 | 0 (no object)..4095 (object very close) |
+/// | 21..28 | Ambient light of the proximity sensors 0..7 | 0 (strong light)..4095 (dark) |
+/// | 29 | Time of flight distance | millimeters |
+/// | 30..33 | Microphones volume 0..3 (right, left, back, front) | 0..4095 |
+/// | 34, 35 | Left and right motor steps | 1000 steps per wheel revolution |
+/// | 36 | Battery (raw) | raw ADC value |
+/// | 37 | Micro SD state | 1 if available, 0 otherwise |
+/// | 38, 39, 40 | TV remote toggle, address, data | RC5 protocol |
+/// | 41 | Selector position | 0..15 |
+/// | 42, 43, 44 | Ground sensors 0..2 (ground sensors extension) | 0 (no surface or black)..1023 (white) |
+/// | 45, 46, 47 | Ambient light of the ground sensors 0..2 | 0 (strong light)..1023 (dark) |
+/// | 48 | User button | 1 pressed, 0 released |
+/// \example Print the proximity sensors and the selector position
+///     import epuck2
+///     s = epuck2.get_all_sensors()
+///     print("proximity:", s[13:21])
+///     print("selector:", s[41])
+/// \endexample
 mp_obj_t epuck2_get_all_sensors(void) {
     mp_obj_list_t *data = MP_OBJ_TO_PTR(mp_obj_new_list(49, NULL));
     uint8_t values[103];
@@ -378,9 +556,13 @@ mp_obj_t epuck2_get_all_sensors(void) {
     data->items[6] = mp_obj_new_int((int16_t)(values[18] + (values[19]<<8)));
     data->items[7] = mp_obj_new_int((int16_t)(values[20] + (values[21]<<8)));
     data->items[8] = mp_obj_new_int((int16_t)(values[22] + (values[23]<<8)));
-    data->items[9] = mp_obj_new_float(values[24] + (values[25]<<8) + (values[26]<<16) + (values[27]<<24));
-    data->items[10] = mp_obj_new_float(values[28] + (values[29]<<8) + (values[30]<<16) + (values[31]<<24));
-    data->items[11] = mp_obj_new_float(values[32] + (values[33]<<8) + (values[34]<<16) + (values[35]<<24));
+    // Magnetometer: floats, like the acceleration magnitude, orientation and inclination.
+    memcpy(&tempf, &values[24], sizeof(float));
+    data->items[9] = mp_obj_new_float(tempf);
+    memcpy(&tempf, &values[28], sizeof(float));
+    data->items[10] = mp_obj_new_float(tempf);
+    memcpy(&tempf, &values[32], sizeof(float));
+    data->items[11] = mp_obj_new_float(tempf);
     data->items[12] = mp_obj_new_int(values[36]);
     data->items[13] = mp_obj_new_int(values[37] + (((uint16_t)values[38])<<8));
     data->items[14] = mp_obj_new_int(values[39] + (((uint16_t)values[40])<<8));
@@ -422,10 +604,18 @@ mp_obj_t epuck2_get_all_sensors(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_get_all_sensors_obj, epuck2_get_all_sensors);
 
-/// \method epuck2_play_freq()
-/// Play a tone at specified frequency.
-/// \param  value: frequency in Hz from 100 to 10000 Hz
-/// Return `None`.
+/// \function play_freq(value)
+/// Play a tone at the given frequency, until another frequency or 0 is given.
+/// \param value frequency in Hz, between 100 and 10000 (values outside the range are limited to it); 0 stops the tone.
+/// \example Play 500 Hz, then 2000 Hz, then stop
+///     import epuck2
+///     import time
+///     epuck2.play_freq(500)
+///     time.sleep(1)
+///     epuck2.play_freq(2000)
+///     time.sleep(1)
+///     epuck2.play_freq(0)
+/// \endexample
 mp_obj_t epuck2_play_freq(mp_obj_t value) {
     uint16_t val = mp_obj_get_int(value);
     if((val < 100) && (val != 0)) // 0 to stop sound
@@ -441,10 +631,18 @@ mp_obj_t epuck2_play_freq(mp_obj_t value) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(epuck2_play_freq_obj, epuck2_play_freq);
 
-/// \method epuck2_get_mic_data()
-/// Get the raw data for all 4 microphones (160 samples, 16 bits for each channel, 10 ms of data). This is a blocking function.
-/// \param  buufer: interleaved data (right, left, back, front))
-/// Return true in case of success, false otherwise.
+/// \function get_mic_data(buffer)
+/// Get the samples of the 4 microphones: 160 samples per microphone, 10 ms of sound (16 kHz sampling rate). The function waits until the data is received.
+/// \param buffer bytearray of at least 1280 bytes, filled with 16-bit signed samples (little endian) interleaved as right, left, back, front: `R0, L0, B0, F0, R1, L1, ..., F159`.
+/// \return `True` on success, `False` otherwise. Raise `ValueError` if the buffer is smaller than 1280 bytes.
+/// \example Get the samples of the front microphone
+///     import epuck2
+///     import struct
+///     buf = bytearray(1280)
+///     if epuck2.get_mic_data(buf):
+///         front = [struct.unpack_from("<h", buf, (i * 4 + 3) * 2)[0] for i in range(160)]
+///         print(max(front), min(front))
+/// \endexample
 mp_obj_t epuck2_get_mic_data(mp_obj_t buffer_obj) {
     // Get a pointer to the internal memory of the MicroPython bytearray
     mp_buffer_info_t bufinfo;
@@ -553,15 +751,21 @@ static mp_obj_t camera_get_image_uart(mp_buffer_info_t *bufinfo) {
     return mp_obj_new_int_from_uint(cam_last_id);
 }
 
-/// \method camera_get_image(buffer, timeout_ms=1000)
-/// Copy a camera image into "buffer": a bytearray of width*height*bytes_per_pixel bytes of the current format
-/// (camera_get_format()), CAM_IMAGE_SIZE bytes are enough for every format.
-/// - selector 15 (SPI): waits for an image newer than the one returned by the previous call (at most timeout_ms);
-/// - other selector positions (UART): requests a new image to the F407 and waits for it (timeout_ms isn't used,
-///   the request fails by itself after about 1 s without answer).
-/// The image format is returned by camera_get_format(). Pixels are stored row by row; RGB565 uses 2 bytes per
-/// pixel big endian (RRRRRGGG GGGBBBBB), greyscale 1 byte per pixel.
-/// Return the image id (incremented at each image received), or None on timeout/error.
+/// \function camera_get_image(buffer, timeout_ms=1000)
+/// Copy a new camera image into `buffer`, in the format returned by `camera_get_format()`.
+/// - Selector 15 (SPI): wait for an image newer than the one returned by the previous call, at most `timeout_ms` milliseconds (-1 waits forever, Ctrl-C stops the wait).
+/// - Selector 3 (UART): request a new image to the main microcontroller and wait for it. `timeout_ms` is not used: the request fails by itself after about 1 s without answer.
+/// \param buffer bytearray of at least width * height * bytes_per_pixel bytes of the current format. `CAM_IMAGE_SIZE` bytes are enough for every format.
+/// \param timeout_ms maximum waiting time in milliseconds (SPI only), default 1000.
+/// \return the image id, incremented at each image received (images skipped by the program can be detected by comparing consecutive ids), or `None` on timeout or error.
+/// \example Get an image and print the value of the central pixel
+///     import epuck2
+///     img = bytearray(epuck2.CAM_IMAGE_SIZE)
+///     if epuck2.camera_get_image(img) is not None:
+///         width, height, bpp = epuck2.camera_get_format()
+///         i = ((height // 2) * width + width // 2) * bpp
+///         print(img[i:i + bpp])
+/// \endexample
 static mp_obj_t epuck2_camera_get_image(size_t n_args, const mp_obj_t *args) {
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(args[0], &bufinfo, MP_BUFFER_WRITE);
@@ -574,9 +778,15 @@ static mp_obj_t epuck2_camera_get_image(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(epuck2_camera_get_image_obj, 1, 2, epuck2_camera_get_image);
 
-/// \method camera_get_format()
-/// Return (width, height, bytes_per_pixel) of the images returned by camera_get_image(): bytes_per_pixel is 2 for
-/// RGB565 and 1 for greyscale. In UART mode the format is known only after the first image (None before).
+/// \function camera_get_format()
+/// Get the format of the images returned by `camera_get_image()`.
+/// \return tuple `(width, height, bytes_per_pixel)`: `bytes_per_pixel` is 2 for RGB565 and 1 for greyscale. With selector 3 (UART) the format is known only after the first image, so `None` is returned before it.
+/// \example Print the image format
+///     import epuck2
+///     img = bytearray(epuck2.CAM_IMAGE_SIZE)
+///     epuck2.camera_get_image(img)
+///     print(epuck2.camera_get_format())  # (160, 120, 2) with selector 15.
+/// \endexample
 static mp_obj_t epuck2_camera_get_format(void) {
     camera_source();
     if (cam_bpp == 0) {
@@ -595,23 +805,30 @@ static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_camera_get_format_obj, epuck2_camera_get
 #define CAM_SENSOR_HEIGHT       480
 #define CAM_UART_MAX_IMAGE_SIZE 4136 // Asercom image buffer on the F407.
 
-/// \method camera_set_format(width, height, bytes_per_pixel=2, zoom=4, x1=-1, y1=-1)
-/// Set the format of the images returned by camera_get_image():
-/// - width, height: image size in pixels;
-/// - bytes_per_pixel: 2 for RGB565, 1 for greyscale;
-/// - zoom: sensor pixels per image pixel, the image covers (width*zoom)x(height*zoom) pixels of the 640x480 sensor;
-/// - x1, y1: top-left corner of that area on the sensor, -1 to center it.
-/// Allowed values depend on the image source:
-/// - selector 15 (SPI): the F407 always streams the whole sensor at zoom 4 (160x120 RGB565), the ESP32 crops and
-///   converts it: zoom 4 (crop at full resolution), 8 (each pixel is the average of 2x2 stream pixels) or 16 (4x4);
-///   x1, y1 are rounded down to multiples of 4. Default 160x120 RGB565 zoom 4. E.g. (80, 60, 1, 8): whole view,
-///   greyscale, half resolution (4800 bytes); (80, 60, 2, 4): central 80x60 area at full resolution.
-/// - other selector positions (UART): the format is set on the F407 (command "J"): zoom 1, 2 or 4, width and
-///   height 1..255, at most 4136 bytes. Default 40x40 RGB565 zoom 4.
-/// Return True if the format is set (UART: confirmed by the F407), False otherwise.
-/// Raise ValueError("invalid camera format") if a parameter is out of range.
-/// (A single error message is used on purpose: every new MP_ERROR_TEXT message makes all the error texts of the
-/// firmware, ulab included, more expensive to compile; 7 messages made the firmware about 17 KB bigger.)
+/// \function camera_set_format(width, height, bytes_per_pixel=2, zoom=4, x1=-1, y1=-1)
+/// Set the format of the images returned by `camera_get_image()`. The image covers an area of (width * zoom) x (height * zoom) pixels of the 640x480 camera sensor: a smaller zoom gives a more magnified image.
+/// \param width image width in pixels.
+/// \param height image height in pixels.
+/// \param bytes_per_pixel 2 for RGB565 (color), 1 for greyscale.
+/// \param zoom sensor pixels per image pixel, see below.
+/// \param x1 left side of the area on the sensor, -1 to center the area horizontally.
+/// \param y1 top side of the area on the sensor, -1 to center the area vertically.
+/// The allowed values depend on the selector position:
+/// - Selector 15 (SPI): the main microcontroller always streams the whole sensor at zoom 4 (160x120 RGB565) and the ESP32 converts the image while copying it. Zoom 4 crops the stream at full resolution, zoom 8 averages 2x2 stream pixels, zoom 16 averages 4x4 stream pixels. `x1` and `y1` are rounded down to multiples of 4. Default 160x120 RGB565 zoom 4.
+/// - Selector 3 (UART): the format is set on the main microcontroller. Zoom 1, 2 or 4, width and height between 1 and 255, image size (width * height * bytes_per_pixel) at most 4136 bytes. Default 40x40 RGB565 zoom 4.
+/// \return `True` if the format is set (UART: confirmed by the main microcontroller), `False` otherwise. Raise `ValueError` if a parameter is out of range.
+/// \example Selector 15: whole view in greyscale at half resolution (80x60, 4800 bytes)
+///     import epuck2
+///     epuck2.camera_set_format(80, 60, 1, 8)
+///     img = bytearray(80 * 60)
+///     epuck2.camera_get_image(img)
+/// \endexample
+/// \example Selector 15: central 80x60 area at full resolution
+///     epuck2.camera_set_format(80, 60, 2, 4)
+/// \endexample
+/// \example Selector 3: 64x64 greyscale image
+///     epuck2.camera_set_format(64, 64, 1, 4)
+/// \endexample
 static mp_obj_t epuck2_camera_set_format(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_width, ARG_height, ARG_bytes_per_pixel, ARG_zoom, ARG_x1, ARG_y1 };
     static const mp_arg_t allowed_args[] = {
@@ -645,6 +862,8 @@ static mp_obj_t epuck2_camera_set_format(size_t n_args, const mp_obj_t *pos_args
             && (zoom == 1 || zoom == 2 || zoom == 4);
     }
     if (!valid) {
+        // A single error message is used on purpose: every new MP_ERROR_TEXT message makes all the error texts of
+        // the firmware (ulab included) more expensive to compile; 7 messages made the firmware about 17 KB bigger.
         mp_raise_ValueError(MP_ERROR_TEXT("invalid camera format"));
     }
 
@@ -679,10 +898,17 @@ static mp_obj_t epuck2_camera_set_format(size_t n_args, const mp_obj_t *pos_args
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(epuck2_camera_set_format_obj, 2, epuck2_camera_set_format);
 
-/// \method camera_get_stats()
-/// Return (frames, errors) since boot or since the last camera_reset_stats():
-/// - SPI: images received by the ESP32 (streamed continuously) and images discarded (unexpected packet size);
-/// - UART: images received and failed requests.
+/// \function camera_get_stats()
+/// Get the image counters since boot or since the last `camera_reset_stats()`.
+/// \return tuple `(frames, errors)`. Selector 15 (SPI): images received by the ESP32 (streamed continuously, also when the program doesn't read them) and images discarded because of transfer errors. Selector 3 (UART): images received and failed requests.
+/// \example Measure the frame rate of the SPI stream
+///     import epuck2
+///     import time
+///     epuck2.camera_reset_stats()
+///     time.sleep(5)
+///     frames, errors = epuck2.camera_get_stats()
+///     print(frames / 5, "fps,", errors, "errors")
+/// \endexample
 static mp_obj_t epuck2_camera_get_stats(void) {
     uint32_t frames, errors;
     if (camera_source() == CAM_SRC_SPI) {
@@ -699,8 +925,8 @@ static mp_obj_t epuck2_camera_get_stats(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_camera_get_stats_obj, epuck2_camera_get_stats);
 
-/// \method camera_reset_stats()
-/// Reset the counters returned by camera_get_stats().
+/// \function camera_reset_stats()
+/// Reset the counters returned by `camera_get_stats()`.
 static mp_obj_t epuck2_camera_reset_stats(void) {
     spi_reset_image_stats();
     cam_uart_frames = 0;
@@ -796,10 +1022,16 @@ static mp_obj_t image_blobs(img_sel_t *sel, mp_obj_t roi_obj, mp_int_t min_pixel
     return MP_OBJ_FROM_PTR(list);
 }
 
-/// \method image_get_color(img, fmt, roi=None)
-/// Mean color of the area "roi" of an RGB565 image.
-/// Return (hue, saturation, value): hue 0..359 degrees (0 red, 60 yellow, 120 green, 180 cyan, 240 blue,
-/// 300 magenta), saturation and value (brightness) 0..100.
+/// \function image_get_color(img, fmt, roi=None)
+/// Get the mean color of an area of an RGB565 image, as HSV (hue, saturation, value). It can be used to learn the color of an object placed in front of the camera, then search it with `image_find_blobs_color()`.
+/// \param img RGB565 image.
+/// \param fmt image format `(width, height, 2)`.
+/// \param roi area `(x, y, w, h)`, `None` for the whole image.
+/// \return tuple `(hue, saturation, value)`: hue between 0 and 359 degrees (0 red, 60 yellow, 120 green, 180 cyan, 240 blue, 300 magenta), saturation (0 grey, 100 pure color) and value (brightness, 0 black) between 0 and 100.
+/// \example Learn the color of the object in the middle of a 80x60 image
+///     hue, sat, val = epuck2.image_get_color(img, (80, 60, 2), roi=(35, 25, 10, 10))
+///     hue_min, hue_max = (hue - 15) % 360, (hue + 15) % 360
+/// \endexample
 static mp_obj_t epuck2_image_get_color(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_img, ARG_fmt, ARG_roi };
     static const mp_arg_t allowed_args[] = {
@@ -825,13 +1057,31 @@ static mp_obj_t epuck2_image_get_color(size_t n_args, const mp_obj_t *pos_args, 
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(epuck2_image_get_color_obj, 2, epuck2_image_get_color);
 
-/// \method image_find_blobs_color(img, fmt, hue_min, hue_max, sat_min=30, sat_max=100, val_min=10, val_max=100,
-///                                 roi=None, min_pixels=10, max_blobs=8)
-/// Find the blobs of an RGB565 image whose pixels have hue between hue_min and hue_max (0..359; if
-/// hue_min > hue_max the range wraps around 0, e.g. 340, 20 for red), saturation between sat_min and sat_max and
-/// value (brightness) between val_min and val_max (0..100).
-/// Return the blobs with at least min_pixels pixels (at most max_blobs, 1..64), biggest first:
-/// [(pixels, cx, cy, x_min, y_min, x_max, y_max), ...], [] if none.
+/// \function image_find_blobs_color(img, fmt, hue_min, hue_max, sat_min=30, sat_max=100, val_min=10, val_max=100, roi=None, min_pixels=10, max_blobs=8)
+/// Find the blobs of the pixels of an RGB565 image whose color is in the given HSV range. The hue doesn't change much when the object is in shadow or more illuminated, so it is more reliable than the RGB values.
+/// \param hue_min minimum hue, between 0 and 359 degrees.
+/// \param hue_max maximum hue, between 0 and 359 degrees. If `hue_min` is greater than `hue_max` the range wraps around 0: for example 340, 20 selects the red colors.
+/// \param sat_min minimum saturation, between 0 and 100 (default 30: greyish pixels, whose hue is unreliable, are ignored).
+/// \param sat_max maximum saturation, between 0 and 100.
+/// \param val_min minimum value (brightness), between 0 and 100 (default 10: dark pixels, whose hue is unreliable, are ignored).
+/// \param val_max maximum value, between 0 and 100.
+/// See the "Image processing" section for `img`, `fmt`, `roi`, `min_pixels` and `max_blobs`.
+/// \return list of blobs `[(pixels, cx, cy, x_min, y_min, x_max, y_max), ...]`, biggest first, `[]` if none.
+/// \example Follow a green object (selector 15)
+///     import epuck2
+///     FMT = (80, 60, 2)
+///     epuck2.camera_set_format(80, 60, 2, 8)
+///     img = bytearray(80 * 60 * 2)
+///     while True:
+///         if epuck2.camera_get_image(img) is None:
+///             continue
+///         blobs = epuck2.image_find_blobs_color(img, FMT, 90, 150, max_blobs=1)
+///         if blobs:
+///             err = blobs[0][1] - 40  # Horizontal distance from the image center.
+///             epuck2.set_motors_speed(300 + 10 * err, 300 - 10 * err)
+///         else:
+///             epuck2.set_motors_speed(0, 0)
+/// \endexample
 static mp_obj_t epuck2_image_find_blobs_color(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_img, ARG_fmt, ARG_hue_min, ARG_hue_max, ARG_sat_min, ARG_sat_max, ARG_val_min, ARG_val_max,
            ARG_roi, ARG_min_pixels, ARG_max_blobs };
@@ -870,9 +1120,16 @@ static mp_obj_t epuck2_image_find_blobs_color(size_t n_args, const mp_obj_t *pos
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(epuck2_image_find_blobs_color_obj, 4, epuck2_image_find_blobs_color);
 
-/// \method image_find_blobs_grey(img, fmt, grey_min, grey_max, roi=None, min_pixels=10, max_blobs=8)
-/// Find the blobs whose pixels have grey level between grey_min and grey_max (0..255; for RGB565 images the
-/// luminance is used). Return the blobs like image_find_blobs_color().
+/// \function image_find_blobs_grey(img, fmt, grey_min, grey_max, roi=None, min_pixels=10, max_blobs=8)
+/// Find the blobs of the pixels whose grey level is in the given range. It works with greyscale and RGB565 images (for RGB565 images the luminance of the pixel is used).
+/// \param grey_min minimum grey level, between 0 (black) and 255 (white).
+/// \param grey_max maximum grey level, between `grey_min` and 255.
+/// See the "Image processing" section for `img`, `fmt`, `roi`, `min_pixels` and `max_blobs`.
+/// \return list of blobs `[(pixels, cx, cy, x_min, y_min, x_max, y_max), ...]`, biggest first, `[]` if none.
+/// \example Find the dark objects in a greyscale image
+///     blobs = epuck2.image_find_blobs_grey(img, (80, 60, 1), 0, 50)
+///     print(len(blobs), "dark objects")
+/// \endexample
 static mp_obj_t epuck2_image_find_blobs_grey(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_img, ARG_fmt, ARG_grey_min, ARG_grey_max, ARG_roi, ARG_min_pixels, ARG_max_blobs };
     static const mp_arg_t allowed_args[] = {
@@ -899,9 +1156,28 @@ static mp_obj_t epuck2_image_find_blobs_grey(size_t n_args, const mp_obj_t *pos_
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(epuck2_image_find_blobs_grey_obj, 4, epuck2_image_find_blobs_grey);
 
-/// \method image_diff(img, prev, fmt, threshold=20, roi=None, min_pixels=10, max_blobs=8)
-/// Find the areas that changed between two images of the same format: pixels whose grey level (luminance for
-/// RGB565) differs by at least threshold (1..255). Return the blobs like image_find_blobs_color().
+/// \function image_diff(img, prev, fmt, threshold=20, roi=None, min_pixels=10, max_blobs=8)
+/// Find the areas that changed between two images of the same format (motion detection): the pixels whose grey level (luminance for RGB565 images) differs by at least `threshold`. The robot must not move, otherwise the whole image changes.
+/// \param img current image.
+/// \param prev previous image, same format as `img`.
+/// \param threshold minimum difference of grey level, between 1 and 255 (default 20).
+/// See the "Image processing" section for `fmt`, `roi`, `min_pixels` and `max_blobs`.
+/// \return list of blobs `[(pixels, cx, cy, x_min, y_min, x_max, y_max), ...]`, biggest first, `[]` if none.
+/// \example Detect motion in front of the robot (selector 15)
+///     import epuck2
+///     FMT = (80, 60, 1)
+///     epuck2.camera_set_format(80, 60, 1, 8)
+///     img = bytearray(80 * 60)
+///     prev = bytearray(80 * 60)
+///     epuck2.camera_get_image(prev)
+///     while True:
+///         if epuck2.camera_get_image(img) is None:
+///             continue
+///         moving = epuck2.image_diff(img, prev, FMT, min_pixels=30, max_blobs=1)
+///         if moving:
+///             print("motion at", moving[0][1], moving[0][2])
+///         img, prev = prev, img  # The current image becomes the previous one.
+/// \endexample
 static mp_obj_t epuck2_image_diff(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_img, ARG_prev, ARG_fmt, ARG_threshold, ARG_roi, ARG_min_pixels, ARG_max_blobs };
     static const mp_arg_t allowed_args[] = {
@@ -928,6 +1204,13 @@ static mp_obj_t epuck2_image_diff(size_t n_args, const mp_obj_t *pos_args, mp_ma
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(epuck2_image_diff_obj, 3, epuck2_image_diff);
 
+/// \constant CAM_IMAGE_SIZE
+/// Size in bytes of the biggest camera image (160x120 RGB565, 38400 bytes): a buffer of this size can hold the images of every format.
+/// \example Allocate the image buffer
+///     import epuck2
+///     img = bytearray(epuck2.CAM_IMAGE_SIZE)
+/// \endexample
+
 mp_rom_map_elem_t epuck2_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_epuck2) },
 
@@ -944,6 +1227,7 @@ mp_rom_map_elem_t epuck2_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_get_battery), MP_ROM_PTR(&epuck2_get_battery_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_gyro_raw), MP_ROM_PTR(&epuck2_get_gyro_raw_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_tv_remote), MP_ROM_PTR(&epuck2_get_tv_remote_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_magnetometer), MP_ROM_PTR(&epuck2_set_magnetometer_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_selector), MP_ROM_PTR(&epuck2_get_selector_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_leds), MP_ROM_PTR(&epuck2_set_leds_obj) },
     { MP_ROM_QSTR(MP_QSTR_play_sound), MP_ROM_PTR(&epuck2_play_sound_obj) },
