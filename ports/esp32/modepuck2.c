@@ -46,6 +46,7 @@
 #include "../../../../../main/button_e-puck2.h"
 #include "../../../../../main/spi_e-puck2.h"
 #include "py/mpthread.h"
+#include "epuck2_image.h"
 
 char api_version[6] = "XX.XX\0";
 char temp_buff[512];
@@ -469,7 +470,8 @@ static MP_DEFINE_CONST_FUN_OBJ_1(epuck2_get_mic_data_obj, epuck2_get_mic_data);
 /******************************************************************************/
 // Camera.
 // The image source depends on the F407 selector position (read at the first camera call):
-// - selector 15: the F407 streams 160x120 RGB565 images to the ESP32 through SPI;
+// - selector 15: the F407 streams 160x120 RGB565 images to the ESP32 through SPI, the format set with
+//   camera_set_format() (crop, downscale, greyscale) is applied by the ESP32 while copying the image;
 // - other positions (e.g. 3): the image is requested to the F407 with the asercom command -'I' through UART
 //   (default 40x40 RGB565, format set on the F407 side, at most 4136 bytes).
 
@@ -481,6 +483,7 @@ static uint8_t cam_source = CAM_SRC_UNKNOWN;
 static uint32_t cam_last_id = 0;
 static uint8_t cam_width = 0, cam_height = 0, cam_bpp = 0; // Format of the last image (0 = unknown).
 static uint32_t cam_uart_frames = 0, cam_uart_errors = 0;
+static spi_img_fmt_t cam_spi_fmt = {0, 0, SPI_IMG_WIDTH, SPI_IMG_HEIGHT, 1, false}; // Conversion of the SPI image.
 
 static uint8_t camera_source(void) {
     if (cam_source == CAM_SRC_UNKNOWN) {
@@ -501,7 +504,7 @@ static uint8_t camera_source(void) {
 }
 
 static mp_obj_t camera_get_image_spi(mp_buffer_info_t *bufinfo, mp_int_t timeout_ms) {
-    if (bufinfo->len < SPI_IMG_SIZE) {
+    if (bufinfo->len < (size_t)cam_width * cam_height * cam_bpp) {
         mp_raise_ValueError(MP_ERROR_TEXT("buffer too small"));
     }
     mp_uint_t start = mp_hal_ticks_ms();
@@ -515,7 +518,7 @@ static mp_obj_t camera_get_image_spi(mp_buffer_info_t *bufinfo, mp_int_t timeout
             uint32_t id = 0;
             int32_t n;
             MP_THREAD_GIL_EXIT();
-            n = spi_copy_image((uint8_t *)bufinfo->buf, bufinfo->len, &id);
+            n = spi_copy_image((uint8_t *)bufinfo->buf, bufinfo->len, &id, &cam_spi_fmt);
             MP_THREAD_GIL_ENTER();
             if (n > 0) {
                 cam_last_id = id;
@@ -551,7 +554,8 @@ static mp_obj_t camera_get_image_uart(mp_buffer_info_t *bufinfo) {
 }
 
 /// \method camera_get_image(buffer, timeout_ms=1000)
-/// Copy a camera image into "buffer" (bytearray, CAM_IMAGE_SIZE bytes are enough for every mode).
+/// Copy a camera image into "buffer": a bytearray of width*height*bytes_per_pixel bytes of the current format
+/// (camera_get_format()), CAM_IMAGE_SIZE bytes are enough for every format.
 /// - selector 15 (SPI): waits for an image newer than the one returned by the previous call (at most timeout_ms);
 /// - other selector positions (UART): requests a new image to the F407 and waits for it (timeout_ms isn't used,
 ///   the request fails by itself after about 1 s without answer).
@@ -592,14 +596,20 @@ static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_camera_get_format_obj, epuck2_camera_get
 #define CAM_UART_MAX_IMAGE_SIZE 4136 // Asercom image buffer on the F407.
 
 /// \method camera_set_format(width, height, bytes_per_pixel=2, zoom=4, x1=-1, y1=-1)
-/// Set the image format (UART mode only, i.e. selector different from 15, where the format is fixed to 160x120):
-/// - width, height: image size in pixels (1..255), width*height*bytes_per_pixel must be at most 4136 bytes;
+/// Set the format of the images returned by camera_get_image():
+/// - width, height: image size in pixels;
 /// - bytes_per_pixel: 2 for RGB565, 1 for greyscale;
-/// - zoom: subsampling factor 1, 2 or 4, the image covers (width*zoom)x(height*zoom) pixels of the 640x480 sensor;
+/// - zoom: sensor pixels per image pixel, the image covers (width*zoom)x(height*zoom) pixels of the 640x480 sensor;
 /// - x1, y1: top-left corner of that area on the sensor, -1 to center it.
-/// Default format on the F407: 40x40 RGB565, zoom 4, centered.
-/// Return True if the F407 confirmed the new format, False otherwise.
-/// Raise ValueError("invalid camera format") if a parameter is out of range or with selector 15.
+/// Allowed values depend on the image source:
+/// - selector 15 (SPI): the F407 always streams the whole sensor at zoom 4 (160x120 RGB565), the ESP32 crops and
+///   converts it: zoom 4 (crop at full resolution), 8 (each pixel is the average of 2x2 stream pixels) or 16 (4x4);
+///   x1, y1 are rounded down to multiples of 4. Default 160x120 RGB565 zoom 4. E.g. (80, 60, 1, 8): whole view,
+///   greyscale, half resolution (4800 bytes); (80, 60, 2, 4): central 80x60 area at full resolution.
+/// - other selector positions (UART): the format is set on the F407 (command "J"): zoom 1, 2 or 4, width and
+///   height 1..255, at most 4136 bytes. Default 40x40 RGB565 zoom 4.
+/// Return True if the format is set (UART: confirmed by the F407), False otherwise.
+/// Raise ValueError("invalid camera format") if a parameter is out of range.
 /// (A single error message is used on purpose: every new MP_ERROR_TEXT message makes all the error texts of the
 /// firmware, ulab included, more expensive to compile; 7 messages made the firmware about 17 KB bigger.)
 static mp_obj_t epuck2_camera_set_format(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
@@ -621,18 +631,38 @@ static mp_obj_t epuck2_camera_set_format(size_t n_args, const mp_obj_t *pos_args
     mp_int_t x1 = args[ARG_x1].u_int;
     mp_int_t y1 = args[ARG_y1].u_int;
 
-    // The F407 doesn't report configuration errors, so check here everything the camera driver would refuse:
-    // size 1..255 (1 byte in the image header), image at most 4136 bytes, zoom 1/2/4, area inside the sensor.
-    if (camera_source() == CAM_SRC_SPI
-        || width < 1 || width > 255 || height < 1 || height > 255
-        || (bpp != 1 && bpp != 2)
-        || width * height * bpp > CAM_UART_MAX_IMAGE_SIZE
-        || (zoom != 1 && zoom != 2 && zoom != 4)
-        || width * zoom > CAM_SENSOR_WIDTH || height * zoom > CAM_SENSOR_HEIGHT
-        || x1 < -1 || y1 < -1
-        || (x1 >= 0 && x1 + width * zoom > CAM_SENSOR_WIDTH)
-        || (y1 >= 0 && y1 + height * zoom > CAM_SENSOR_HEIGHT)) {
+    bool spi = (camera_source() == CAM_SRC_SPI);
+    bool valid = width >= 1 && height >= 1 && (bpp == 1 || bpp == 2) && x1 >= -1 && y1 >= -1
+        && width * zoom <= CAM_SENSOR_WIDTH && height * zoom <= CAM_SENSOR_HEIGHT
+        && (x1 < 0 || x1 + width * zoom <= CAM_SENSOR_WIDTH)
+        && (y1 < 0 || y1 + height * zoom <= CAM_SENSOR_HEIGHT);
+    if (spi) {
+        valid = valid && (zoom == 4 || zoom == 8 || zoom == 16);
+    } else {
+        // The F407 doesn't report configuration errors, so check here everything the camera driver would refuse:
+        // size 1..255 (1 byte in the image header), image at most 4136 bytes, zoom 1/2/4.
+        valid = valid && width <= 255 && height <= 255 && width * height * bpp <= CAM_UART_MAX_IMAGE_SIZE
+            && (zoom == 1 || zoom == 2 || zoom == 4);
+    }
+    if (!valid) {
         mp_raise_ValueError(MP_ERROR_TEXT("invalid camera format"));
+    }
+
+    if (spi) {
+        // Area in stream pixels (1 stream pixel = 4x4 sensor pixels).
+        mp_int_t step = zoom / 4;
+        mp_int_t x0 = (x1 < 0) ? (SPI_IMG_WIDTH - width * step) / 2 : x1 / 4;
+        mp_int_t y0 = (y1 < 0) ? (SPI_IMG_HEIGHT - height * step) / 2 : y1 / 4;
+        cam_spi_fmt.x0 = x0;
+        cam_spi_fmt.y0 = y0;
+        cam_spi_fmt.width = width;
+        cam_spi_fmt.height = height;
+        cam_spi_fmt.step = step;
+        cam_spi_fmt.grey = (bpp == 1);
+        cam_width = width;
+        cam_height = height;
+        cam_bpp = bpp;
+        return mp_const_true;
     }
 
     int8_t ret;
@@ -679,6 +709,225 @@ static mp_obj_t epuck2_camera_reset_stats(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(epuck2_camera_reset_stats_obj, epuck2_camera_reset_stats);
 
+/******************************************************************************/
+// Image processing on the images returned by camera_get_image() (any buffer can be used).
+// fmt: (width, height, bytes_per_pixel) as returned by camera_get_format().
+// roi: (x, y, w, h) area to process, None for the whole image.
+// Blobs: groups of selected pixels touching each other, returned as a list of
+// (pixels, cx, cy, x_min, y_min, x_max, y_max) sorted by size (biggest first).
+// Existing error messages are used on purpose (see camera_set_format()).
+
+#define IMAGE_MAX_BLOBS 64
+
+static void image_parse_fmt(mp_obj_t fmt_obj, img_fmt_t *fmt) {
+    size_t len;
+    mp_obj_t *items;
+    mp_obj_get_array(fmt_obj, &len, &items);
+    if (len != 3) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid arguments"));
+    }
+    mp_int_t w = mp_obj_get_int(items[0]), h = mp_obj_get_int(items[1]), bpp = mp_obj_get_int(items[2]);
+    if (w < 1 || w > 0xFFFF || h < 1 || h > 0xFFFF || (bpp != 1 && bpp != 2)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid arguments"));
+    }
+    fmt->width = w;
+    fmt->height = h;
+    fmt->bpp = bpp;
+}
+
+static const uint8_t *image_get_buffer(mp_obj_t buf_obj, const img_fmt_t *fmt) {
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(buf_obj, &bufinfo, MP_BUFFER_READ);
+    if (bufinfo.len < (size_t)fmt->width * fmt->height * fmt->bpp) {
+        mp_raise_ValueError(MP_ERROR_TEXT("buffer too small"));
+    }
+    return (const uint8_t *)bufinfo.buf;
+}
+
+static void image_parse_roi(mp_obj_t roi_obj, const img_fmt_t *fmt, img_roi_t *roi) {
+    if (roi_obj == mp_const_none) {
+        roi->x = roi->y = 0;
+        roi->w = fmt->width;
+        roi->h = fmt->height;
+        return;
+    }
+    size_t len;
+    mp_obj_t *items;
+    mp_obj_get_array(roi_obj, &len, &items);
+    if (len != 4) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid arguments"));
+    }
+    mp_int_t x = mp_obj_get_int(items[0]), y = mp_obj_get_int(items[1]);
+    mp_int_t w = mp_obj_get_int(items[2]), h = mp_obj_get_int(items[3]);
+    if (x < 0 || y < 0 || w < 1 || h < 1 || x + w > fmt->width || y + h > fmt->height) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid arguments"));
+    }
+    roi->x = x;
+    roi->y = y;
+    roi->w = w;
+    roi->h = h;
+}
+
+static mp_obj_t image_blobs(img_sel_t *sel, mp_obj_t roi_obj, mp_int_t min_pixels, mp_int_t max_blobs) {
+    img_roi_t roi;
+    if (min_pixels < 1 || max_blobs < 1 || max_blobs > IMAGE_MAX_BLOBS) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid arguments"));
+    }
+    image_parse_roi(roi_obj, &sel->fmt, &roi);
+    size_t work_size = img_blobs_work_size(roi.w);
+    uint8_t *work = m_new(uint8_t, work_size);
+    img_blob_t *blobs = m_new(img_blob_t, max_blobs);
+    int n = img_find_blobs(sel, &roi, min_pixels, blobs, max_blobs, work);
+    mp_obj_list_t *list = MP_OBJ_TO_PTR(mp_obj_new_list(n, NULL));
+    for (int i = 0; i < n; i++) {
+        mp_obj_t items[7] = {
+            mp_obj_new_int_from_uint(blobs[i].pixels),
+            MP_OBJ_NEW_SMALL_INT(blobs[i].cx),
+            MP_OBJ_NEW_SMALL_INT(blobs[i].cy),
+            MP_OBJ_NEW_SMALL_INT(blobs[i].x_min),
+            MP_OBJ_NEW_SMALL_INT(blobs[i].y_min),
+            MP_OBJ_NEW_SMALL_INT(blobs[i].x_max),
+            MP_OBJ_NEW_SMALL_INT(blobs[i].y_max),
+        };
+        list->items[i] = mp_obj_new_tuple(7, items);
+    }
+    m_del(img_blob_t, blobs, max_blobs);
+    m_del(uint8_t, work, work_size);
+    return MP_OBJ_FROM_PTR(list);
+}
+
+/// \method image_get_color(img, fmt, roi=None)
+/// Mean color of the area "roi" of an RGB565 image.
+/// Return (hue, saturation, value): hue 0..359 degrees (0 red, 60 yellow, 120 green, 180 cyan, 240 blue,
+/// 300 magenta), saturation and value (brightness) 0..100.
+static mp_obj_t epuck2_image_get_color(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_img, ARG_fmt, ARG_roi };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_img, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
+        { MP_QSTR_fmt, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
+        { MP_QSTR_roi, MP_ARG_OBJ, {.u_obj = mp_const_none} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+    img_fmt_t fmt;
+    img_roi_t roi;
+    image_parse_fmt(args[ARG_fmt].u_obj, &fmt);
+    if (fmt.bpp != 2) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid arguments"));
+    }
+    const uint8_t *img = image_get_buffer(args[ARG_img].u_obj, &fmt);
+    image_parse_roi(args[ARG_roi].u_obj, &fmt, &roi);
+    uint16_t h;
+    uint8_t s, v;
+    img_get_color(img, &fmt, &roi, &h, &s, &v);
+    mp_obj_t items[3] = { MP_OBJ_NEW_SMALL_INT(h), MP_OBJ_NEW_SMALL_INT(s), MP_OBJ_NEW_SMALL_INT(v) };
+    return mp_obj_new_tuple(3, items);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(epuck2_image_get_color_obj, 2, epuck2_image_get_color);
+
+/// \method image_find_blobs_color(img, fmt, hue_min, hue_max, sat_min=30, sat_max=100, val_min=10, val_max=100,
+///                                 roi=None, min_pixels=10, max_blobs=8)
+/// Find the blobs of an RGB565 image whose pixels have hue between hue_min and hue_max (0..359; if
+/// hue_min > hue_max the range wraps around 0, e.g. 340, 20 for red), saturation between sat_min and sat_max and
+/// value (brightness) between val_min and val_max (0..100).
+/// Return the blobs with at least min_pixels pixels (at most max_blobs, 1..64), biggest first:
+/// [(pixels, cx, cy, x_min, y_min, x_max, y_max), ...], [] if none.
+static mp_obj_t epuck2_image_find_blobs_color(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_img, ARG_fmt, ARG_hue_min, ARG_hue_max, ARG_sat_min, ARG_sat_max, ARG_val_min, ARG_val_max,
+           ARG_roi, ARG_min_pixels, ARG_max_blobs };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_img, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
+        { MP_QSTR_fmt, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
+        { MP_QSTR_hue_min, MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_hue_max, MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_sat_min, MP_ARG_INT, {.u_int = 30} },
+        { MP_QSTR_sat_max, MP_ARG_INT, {.u_int = 100} },
+        { MP_QSTR_val_min, MP_ARG_INT, {.u_int = 10} },
+        { MP_QSTR_val_max, MP_ARG_INT, {.u_int = 100} },
+        { MP_QSTR_roi, MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_min_pixels, MP_ARG_INT, {.u_int = 10} },
+        { MP_QSTR_max_blobs, MP_ARG_INT, {.u_int = 8} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+    img_sel_t sel = { .type = IMG_SEL_COLOR };
+    image_parse_fmt(args[ARG_fmt].u_obj, &sel.fmt);
+    mp_int_t hue_min = args[ARG_hue_min].u_int, hue_max = args[ARG_hue_max].u_int;
+    mp_int_t sat_min = args[ARG_sat_min].u_int, sat_max = args[ARG_sat_max].u_int;
+    mp_int_t val_min = args[ARG_val_min].u_int, val_max = args[ARG_val_max].u_int;
+    if (sel.fmt.bpp != 2 || hue_min < 0 || hue_min > 359 || hue_max < 0 || hue_max > 359
+        || sat_min < 0 || sat_min > sat_max || sat_max > 100 || val_min < 0 || val_min > val_max || val_max > 100) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid arguments"));
+    }
+    sel.img = image_get_buffer(args[ARG_img].u_obj, &sel.fmt);
+    sel.hue_min = hue_min;
+    sel.hue_max = hue_max;
+    sel.sat_min = sat_min;
+    sel.sat_max = sat_max;
+    sel.val_min = val_min;
+    sel.val_max = val_max;
+    return image_blobs(&sel, args[ARG_roi].u_obj, args[ARG_min_pixels].u_int, args[ARG_max_blobs].u_int);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(epuck2_image_find_blobs_color_obj, 4, epuck2_image_find_blobs_color);
+
+/// \method image_find_blobs_grey(img, fmt, grey_min, grey_max, roi=None, min_pixels=10, max_blobs=8)
+/// Find the blobs whose pixels have grey level between grey_min and grey_max (0..255; for RGB565 images the
+/// luminance is used). Return the blobs like image_find_blobs_color().
+static mp_obj_t epuck2_image_find_blobs_grey(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_img, ARG_fmt, ARG_grey_min, ARG_grey_max, ARG_roi, ARG_min_pixels, ARG_max_blobs };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_img, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
+        { MP_QSTR_fmt, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
+        { MP_QSTR_grey_min, MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_grey_max, MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_roi, MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_min_pixels, MP_ARG_INT, {.u_int = 10} },
+        { MP_QSTR_max_blobs, MP_ARG_INT, {.u_int = 8} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+    img_sel_t sel = { .type = IMG_SEL_GREY };
+    image_parse_fmt(args[ARG_fmt].u_obj, &sel.fmt);
+    mp_int_t grey_min = args[ARG_grey_min].u_int, grey_max = args[ARG_grey_max].u_int;
+    if (grey_min < 0 || grey_min > grey_max || grey_max > 255) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid arguments"));
+    }
+    sel.img = image_get_buffer(args[ARG_img].u_obj, &sel.fmt);
+    sel.grey_min = grey_min;
+    sel.grey_max = grey_max;
+    return image_blobs(&sel, args[ARG_roi].u_obj, args[ARG_min_pixels].u_int, args[ARG_max_blobs].u_int);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(epuck2_image_find_blobs_grey_obj, 4, epuck2_image_find_blobs_grey);
+
+/// \method image_diff(img, prev, fmt, threshold=20, roi=None, min_pixels=10, max_blobs=8)
+/// Find the areas that changed between two images of the same format: pixels whose grey level (luminance for
+/// RGB565) differs by at least threshold (1..255). Return the blobs like image_find_blobs_color().
+static mp_obj_t epuck2_image_diff(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_img, ARG_prev, ARG_fmt, ARG_threshold, ARG_roi, ARG_min_pixels, ARG_max_blobs };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_img, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
+        { MP_QSTR_prev, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
+        { MP_QSTR_fmt, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
+        { MP_QSTR_threshold, MP_ARG_INT, {.u_int = 20} },
+        { MP_QSTR_roi, MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_min_pixels, MP_ARG_INT, {.u_int = 10} },
+        { MP_QSTR_max_blobs, MP_ARG_INT, {.u_int = 8} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+    img_sel_t sel = { .type = IMG_SEL_DIFF };
+    image_parse_fmt(args[ARG_fmt].u_obj, &sel.fmt);
+    mp_int_t threshold = args[ARG_threshold].u_int;
+    if (threshold < 1 || threshold > 255) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid arguments"));
+    }
+    sel.img = image_get_buffer(args[ARG_img].u_obj, &sel.fmt);
+    sel.prev = image_get_buffer(args[ARG_prev].u_obj, &sel.fmt);
+    sel.diff_threshold = threshold;
+    return image_blobs(&sel, args[ARG_roi].u_obj, args[ARG_min_pixels].u_int, args[ARG_max_blobs].u_int);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(epuck2_image_diff_obj, 3, epuck2_image_diff);
+
 mp_rom_map_elem_t epuck2_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_epuck2) },
 
@@ -708,6 +957,10 @@ mp_rom_map_elem_t epuck2_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_camera_get_stats), MP_ROM_PTR(&epuck2_camera_get_stats_obj) },
     { MP_ROM_QSTR(MP_QSTR_camera_reset_stats), MP_ROM_PTR(&epuck2_camera_reset_stats_obj) },
     { MP_ROM_QSTR(MP_QSTR_CAM_IMAGE_SIZE), MP_ROM_INT(SPI_IMG_SIZE) },
+    { MP_ROM_QSTR(MP_QSTR_image_get_color), MP_ROM_PTR(&epuck2_image_get_color_obj) },
+    { MP_ROM_QSTR(MP_QSTR_image_find_blobs_color), MP_ROM_PTR(&epuck2_image_find_blobs_color_obj) },
+    { MP_ROM_QSTR(MP_QSTR_image_find_blobs_grey), MP_ROM_PTR(&epuck2_image_find_blobs_grey_obj) },
+    { MP_ROM_QSTR(MP_QSTR_image_diff), MP_ROM_PTR(&epuck2_image_diff_obj) },
 };
 
 static MP_DEFINE_CONST_DICT(epuck2_module_globals, epuck2_module_globals_table);
