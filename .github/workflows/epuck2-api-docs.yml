@@ -12,6 +12,7 @@ on:
       - "ports/esp32/modepuck2.h"
       - "ports/esp32/epuck2_*"
       - "tools/gen_api_docs.py"
+      - "tools/epuck2-overview.webp"
       - ".github/workflows/epuck2-api-docs.yml"
   workflow_dispatch:
 

@@ -47,6 +47,7 @@ import html
 import json
 import os
 import re
+import shutil
 import sys
 import textwrap
 from dataclasses import dataclass, field
@@ -1073,6 +1074,9 @@ section.api > h2 .from { font-size: 0.8rem; color: var(--muted); font-weight: 40
 .pdf-link:hover { background: var(--accent-soft); }
 
 
+.overview { margin: 0 0 2.5rem; }
+.overview img { display: block; width: 100%; height: auto; }
+.overview figcaption { margin-top: 0.5rem; color: var(--muted); font-size: 0.9rem; }
 .intro { margin-bottom: 3rem; max-width: 72ch; }
 .intro p { margin: 0 0 0.8rem; }
 .intro .example { margin-bottom: 1rem; }
@@ -1297,7 +1301,14 @@ def render_entry(owner: str, entry: Entry, module: str) -> str:
     )
 
 
-def render_html(api: dict, title: str, subtitle: str, pdf_name: str = "") -> str:
+IMAGE_CAPTION = (
+    "Position of the e-puck2 LEDs, proximity sensors, ToF sensor, microphones, speaker, "
+    "IR receiver, IMU, selector and buttons."
+)
+DEFAULT_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "epuck2-overview.webp")
+
+
+def render_html(api: dict, title: str, subtitle: str, pdf_name: str = "", image_name: str = "") -> str:
     module = api["module"]
     version = api.get("version")
 
@@ -1349,6 +1360,12 @@ def render_html(api: dict, title: str, subtitle: str, pdf_name: str = "") -> str
     intro = (
         f'<section class="intro">{render_blocks(api["intro"])}</section>' if api.get("intro") else ""
     )
+    overview = (
+        f'<figure class="overview"><img src="{html.escape(image_name)}" '
+        f'alt="{html.escape(IMAGE_CAPTION)}"><figcaption>{html.escape(IMAGE_CAPTION)}</figcaption></figure>'
+        if image_name
+        else ""
+    )
     pdf_button = (
         f'<a class="pdf-link" href="{html.escape(pdf_name)}" download>Download the PDF version</a>'
         if pdf_name
@@ -1389,7 +1406,7 @@ def render_html(api: dict, title: str, subtitle: str, pdf_name: str = "") -> str
     <p class="nav-count" id="count" data-total="{total} entries">{total} entries</p>
     <nav><ul id="nav">{"".join(nav)}</ul></nav>
   </aside>
-  <main>{intro}{"".join(sections)}</main>
+  <main>{overview}{intro}{"".join(sections)}</main>
 </div>
 <script>{JS}</script>
 </body>
@@ -1462,6 +1479,13 @@ def main(argv: list[str]) -> int:
         help="also write a PDF next to the page and link it (needs weasyprint)",
     )
     parser.add_argument(
+        "--image",
+        default=DEFAULT_IMAGE,
+        metavar="FILE",
+        help="robot picture shown at the top of the page, copied into the output folder "
+        "(default: epuck2-overview.webp next to this script, \"\" for none)",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="exit with an error if an entry is undocumented or a warning is reported",
@@ -1486,7 +1510,15 @@ def main(argv: list[str]) -> int:
             pdf_path = os.path.join(args.output, args.pdf)
             pdf_name = args.pdf
 
-    page = render_html(api, args.title, args.subtitle, pdf_name)
+    image_name = ""
+    if args.image:
+        if os.path.isfile(args.image):
+            image_name = os.path.basename(args.image)
+            shutil.copyfile(args.image, os.path.join(args.output, image_name))
+        else:
+            WARNINGS.append(f"image {args.image} not found, page written without it")
+
+    page = render_html(api, args.title, args.subtitle, pdf_name, image_name)
     index = os.path.join(args.output, "index.html")
     with open(index, "w", encoding="utf-8") as handle:
         handle.write(page)
